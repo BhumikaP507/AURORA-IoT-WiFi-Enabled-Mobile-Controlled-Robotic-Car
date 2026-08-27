@@ -1,81 +1,249 @@
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
+/*
+ * AURORA - IoT WiFi-Enabled Robotic Car (ESP32 version)
+ * -------------------------------------------------------
+ * Upgrades over the original ESP8266 build:
+ *   - True PWM speed control on L298N (ledc hardware PWM, 8 boards used the
+ *     same 8-bit/5kHz scheme as the Obstacle Avoiding Robot for consistency)
+ *   - Front ultrasonic sensor (HC-SR04) for a one-tap "Auto" obstacle-avoid mode
+ *   - Same lightweight web UI, now with a speed slider and Auto/Manual toggle
+ *
+ * NOTE ON "LIVE VIDEO STREAMING": a plain ESP32 devkit has no camera hardware.
+ * To add that claim for real, use a separate ESP32-CAM board running the
+ * standard CameraWebServer example (streams MJPEG on its own IP at :81/stream),
+ * then embed it in this page with:
+ *     <img src="http://<esp32-cam-ip>:81/stream">
+ * Motor control and camera streaming are kept on two boards because the
+ * ESP32-CAM's camera interface uses almost every GPIO, leaving too few free
+ * pins to also drive an L298N reliably.
+ *
+ * Pinout (matches the pin scheme used in the Obstacle Avoiding Robot project
+ * for consistency across your portfolio):
+ *   Left motor:  ENA(PWM)=25, IN1=26, IN2=27
+ *   Right motor: ENB(PWM)=14, IN3=12, IN4=13
+ *   Ultrasonic:  TRIG=5, ECHO=18
+ */
 
-// Replace with your network credentials
-const char* ssid = "5G";
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ---------- WiFi credentials ----------
+const char* ssid     = "5G";
 const char* password = "NE555LM358";
 
-ESP8266WebServer server(80);
+WebServer server(80);
 
-// Motor Pins (L298N)
-int IN1 = 5; // Right Motors Forward
-int IN2 = 4; // Right Motors Backward
-int IN3 = 0; // Left Motors Forward
-int IN4 = 2; // Left Motors Backward
+// ---------- Motor pins (L298N) ----------
+#define ENA 25   // Left motor PWM
+#define IN1 26
+#define IN2 27
+#define ENB 14   // Right motor PWM
+#define IN3 12
+#define IN4 13
 
-// HTML Web Page
-const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-    <title>NodeMCU 4WD Control</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        .button { background-color: #4CAF50; border: none; color: white; padding: 20px; 
-                  text-align: center; display: inline-block; font-size: 20px; margin: 10px; cursor: pointer; 
-                  width: 100px; user-select: none; -webkit-user-select: none; }
-        .stop { background-color: #f44336; }
-    </style>
-</head>
-<body>
-    <center>
-        <h1>4WD WiFi Control</h1>
-        <button class="button" onmousedown="send('/forward')" onmouseup="send('/stop')" ontouchstart="send('/forward')" ontouchend="send('/stop')">Forward</button><br>
-        <button class="button" onmousedown="send('/left')" onmouseup="send('/stop')" ontouchstart="send('/left')" ontouchend="send('/stop')">Left</button>
-        <button class="button" onmousedown="send('/right')" onmouseup="send('/stop')" ontouchstart="send('/right')" ontouchend="send('/stop')">Right</button><br>
-        <button class="button" onmousedown="send('/backward')" onmouseup="send('/stop')" ontouchstart="send('/backward')" ontouchend="send('/stop')">Backward</button>
-    </center>
-    <script>
-        function send(path) {
-            var xhr = new XMLHttpRequest();
-            xhr.open("GET", path, true);
-            xhr.send();
-        }
-    </script>
-</body>
-</html>
-)rawliteral";
+// ---------- Ultrasonic pins ----------
+#define TRIG_PIN 5
+#define ECHO_PIN 18
 
-void handleRoot() { server.send(200, "text/html", index_html); }
+// ---------- PWM config (ESP32 ledc) ----------
+#define PWM_FREQ       5000
+#define PWM_RESOLUTION 8      // 0-255
+#define PWM_CH_LEFT    0
+#define PWM_CH_RIGHT   1
 
-void stopRobot() {
+// ---------- Runtime state ----------
+int   currentSpeed   = 200;   // 0-255, adjustable from the web UI
+bool  autoMode        = false;
+const int OBSTACLE_DIST_CM = 25;
+
+unsigned long lastSensorCheck = 0;
+const unsigned long SENSOR_INTERVAL_MS = 100;
+
+// ================= Motor helpers =================
+void setLeft(int speed, bool fwd) {
+  speed = constrain(speed, 0, 255);
+  digitalWrite(IN1, fwd ? HIGH : LOW);
+  digitalWrite(IN2, fwd ? LOW  : HIGH);
+  ledcWrite(PWM_CH_LEFT, speed);
+}
+
+void setRight(int speed, bool fwd) {
+  speed = constrain(speed, 0, 255);
+  digitalWrite(IN3, fwd ? HIGH : LOW);
+  digitalWrite(IN4, fwd ? LOW  : HIGH);
+  ledcWrite(PWM_CH_RIGHT, speed);
+}
+
+void stopMotors() {
+  ledcWrite(PWM_CH_LEFT, 0);
+  ledcWrite(PWM_CH_RIGHT, 0);
   digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
 }
 
+void moveForward()  { setLeft(currentSpeed, true);  setRight(currentSpeed, true);  }
+void moveBackward() { setLeft(currentSpeed, false); setRight(currentSpeed, false); }
+void turnLeft()     { setLeft(currentSpeed, false); setRight(currentSpeed, true);  }
+void turnRight()     { setLeft(currentSpeed, true);  setRight(currentSpeed, false); }
+
+// ================= Ultrasonic =================
+long readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout ~5m range
+  if (duration == 0) return -1;                    // no echo = treat as clear
+  return duration * 0.034 / 2;
+}
+
+void autoModeStep() {
+  long dist = readDistanceCm();
+  if (dist < 0 || dist > OBSTACLE_DIST_CM) {
+    moveForward();
+  } else {
+    stopMotors();
+    delay(150);
+    moveBackward();
+    delay(300);
+    stopMotors();
+    delay(150);
+    turnRight();
+    delay(400);
+    stopMotors();
+  }
+}
+
+// ================= Web UI =================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AURORA - ESP32 4WD Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: sans-serif; text-align:center; background:#111; color:#eee; }
+    .button { background:#4CAF50; border:none; color:white; padding:20px;
+              font-size:20px; margin:8px; cursor:pointer; width:100px;
+              user-select:none; -webkit-user-select:none; border-radius:8px; }
+    .stop   { background:#f44336; }
+    .mode   { background:#2196F3; width:220px; }
+    input[type=range] { width:250px; }
+  </style>
+</head>
+<body>
+  <h1>AURORA - 4WD Control</h1>
+
+  <p>Speed: <span id="spdVal">200</span></p>
+  <input type="range" min="80" max="255" value="200" id="spd"
+         onchange="setSpeed(this.value)">
+
+  <br>
+  <button class="button mode" id="modeBtn" onclick="toggleMode()">Switch to Auto Mode</button>
+
+  <div id="manualControls">
+    <br>
+    <button class="button" onmousedown="send('/forward')" onmouseup="send('/stop')"
+            ontouchstart="send('/forward')" ontouchend="send('/stop')">Forward</button><br>
+    <button class="button" onmousedown="send('/left')" onmouseup="send('/stop')"
+            ontouchstart="send('/left')" ontouchend="send('/stop')">Left</button>
+    <button class="button" onmousedown="send('/right')" onmouseup="send('/stop')"
+            ontouchstart="send('/right')" ontouchend="send('/stop')">Right</button><br>
+    <button class="button" onmousedown="send('/backward')" onmouseup="send('/stop')"
+            ontouchstart="send('/backward')" ontouchend="send('/stop')">Backward</button>
+  </div>
+
+  <script>
+    let autoMode = false;
+    function send(path) {
+      if (autoMode) return; // ignore manual taps while auto mode drives
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", path, true);
+      xhr.send();
+    }
+    function setSpeed(val) {
+      document.getElementById('spdVal').innerText = val;
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", "/speed?value=" + val, true);
+      xhr.send();
+    }
+    function toggleMode() {
+      autoMode = !autoMode;
+      document.getElementById('modeBtn').innerText =
+        autoMode ? "Switch to Manual Mode" : "Switch to Auto Mode";
+      document.getElementById('manualControls').style.display =
+        autoMode ? "none" : "block";
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", "/mode?auto=" + (autoMode ? "1" : "0"), true);
+      xhr.send();
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot()     { server.send(200, "text/html", index_html); }
+void handleForward()  { if (!autoMode) moveForward();  server.send(200, "text/plain", "ok"); }
+void handleBackward() { if (!autoMode) moveBackward(); server.send(200, "text/plain", "ok"); }
+void handleLeft()     { if (!autoMode) turnLeft();      server.send(200, "text/plain", "ok"); }
+void handleRight()    { if (!autoMode) turnRight();     server.send(200, "text/plain", "ok"); }
+void handleStop()     { if (!autoMode) stopMotors();    server.send(200, "text/plain", "ok"); }
+
+void handleSpeed() {
+  if (server.hasArg("value")) {
+    currentSpeed = constrain(server.arg("value").toInt(), 0, 255);
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+void handleMode() {
+  if (server.hasArg("auto")) {
+    autoMode = server.arg("auto") == "1";
+    if (!autoMode) stopMotors();
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+// ================= Setup / loop =================
 void setup() {
+  Serial.begin(115200);
+
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
-  stopRobot();
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
-  Serial.begin(115200);
+  ledcSetup(PWM_CH_LEFT,  PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(PWM_CH_RIGHT, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(ENA, PWM_CH_LEFT);
+  ledcAttachPin(ENB, PWM_CH_RIGHT);
+
+  stopMotors();
+
   WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  
   Serial.println("\nWiFi connected");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
   server.on("/", handleRoot);
-  server.on("/forward", []() { digitalWrite(IN1, HIGH); digitalWrite(IN3, HIGH); server.send(200); });
-  server.on("/backward", []() { digitalWrite(IN2, HIGH); digitalWrite(IN4, HIGH); server.send(200); });
-  server.on("/left", []() { digitalWrite(IN2, HIGH); digitalWrite(IN3, HIGH); server.send(200); });
-  server.on("/right", []() { digitalWrite(IN1, HIGH); digitalWrite(IN4, HIGH); server.send(200); });
-  server.on("/stop", []() { stopRobot(); server.send(200); });
+  server.on("/forward",  handleForward);
+  server.on("/backward", handleBackward);
+  server.on("/left",     handleLeft);
+  server.on("/right",    handleRight);
+  server.on("/stop",     handleStop);
+  server.on("/speed",    handleSpeed);
+  server.on("/mode",     handleMode);
 
   server.begin();
 }
 
 void loop() {
   server.handleClient();
+
+  if (autoMode && millis() - lastSensorCheck >= SENSOR_INTERVAL_MS) {
+    lastSensorCheck = millis();
+    autoModeStep();
+  }
 }
